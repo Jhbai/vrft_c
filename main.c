@@ -114,7 +114,7 @@ static void send_http_response(int fd, const char* status, const char* body) {
 void* api_router_worker(void* arg) {
     vrft_ctx_t* ctx = (vrft_ctx_t*)arg;
 
-    // 【修正一】加入 Socket Timeout，避免讀取被惡意或慢速請求掛死
+    // 加入 Socket Timeout，避免讀取被惡意或慢速請求掛死
     struct timeval tv;
     tv.tv_sec = 3;  // 3秒超時
     tv.tv_usec = 0;
@@ -124,7 +124,7 @@ void* api_router_worker(void* arg) {
     int total_received = 0;
     char* header_end = NULL;
 
-    // 【修正二】迴圈讀取，確切保證拿到完整的 HTTP Header（找到 \r\n\r\n 為止）
+    // 迴圈讀取，確切保證拿到完整的 HTTP Header（找到 \r\n\r\n 為止）
     while (total_received < sizeof(buffer) - 1) {
         int r = recv(ctx->client_fd, buffer + total_received, sizeof(buffer) - 1 - total_received, 0);
         if (r <= 0) break;
@@ -234,18 +234,16 @@ void* api_router_worker(void* arg) {
             send_http_response(ctx->client_fd, "404 Not Found", "{\"error\": \"Endpoint not found\"}");
         }
     }
-
-    // 【修正三】TCP 優雅關閉 (Graceful Shutdown)，根絕 TCP RST (ConnectionResetError)
-    // 1. SHUT_WR 會告知 Python: "我資料送完了(送出 FIN)"
-    shutdown(ctx->client_fd, SHUT_WR);
     
-    // 2. 把 Python 可能殘留還在送進來的封包吃乾淨 (排空緩衝區)
+    // SHUT_WR 會告知 "我資料送完了(送出 FIN)"
+    shutdown(ctx->client_fd, SHUT_WR);
+
+    // 可能殘留還在送進來的封包吃乾淨 (排空緩衝區)
     char discard[4096];
     while (recv(ctx->client_fd, discard, sizeof(discard), 0) > 0) {
         // do nothing
     }
 
-    // 3. 完美且安全的釋放 Socket 與記憶體
     close(ctx->client_fd);
     if (ctx->y) free(ctx->y);
     if (ctx->u) free(ctx->u);
