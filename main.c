@@ -5,7 +5,9 @@
 #include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <sys/time.h>     // 加入 timeval
 #include <immintrin.h>
+#include <cjson/cJSON.h>  // 使用系統的 cJSON
 
 typedef struct {
     int client_fd;
@@ -15,7 +17,6 @@ typedef struct {
     float *u;
 } __attribute__((aligned(64))) vrft_ctx_t;
 
-// 封裝對齊記憶體分配，處理邊界與錯誤狀況
 static inline void* alloc_aligned(size_t alignment, size_t size) {
     void* ptr = NULL;
     return (posix_memalign(&ptr, alignment, size) == 0) ? ptr : NULL;
@@ -97,49 +98,157 @@ static inline void compute_vrft_lsq(const float* __restrict y, const float* __re
     solve_3x3_lsq(m, v, res);
 }
 
+// 輔助函式：發送 HTTP 回應
+static void send_http_response(int fd, const char* status, const char* body) {
+    char resp[1024];
+    snprintf(resp, sizeof(resp), 
+        "HTTP/1.1 %s\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n\r\n"
+        "%s", 
+        status, strlen(body), body);
+    (void)send(fd, resp, strlen(resp), 0);
+}
+
 void* api_router_worker(void* arg) {
     vrft_ctx_t* ctx = (vrft_ctx_t*)arg;
-    char buffer[4096] = {0};
-    
-    if (recv(ctx->client_fd, buffer, sizeof(buffer) - 1, 0) <= 0) {
-        close(ctx->client_fd);
-        free(ctx);
-        return NULL;
-    }
-    
-    if (strncmp(buffer, "GET /health", 11) == 0) {
-        const char* resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\": \"OK\", \"code\": 200}";
-        (void)send(ctx->client_fd, resp, strlen(resp), 0);
-    } 
-    else if (strncmp(buffer, "POST /vrft", 10) == 0) {
-        ctx->tau = 1024;
-        ctx->high_limit = 100.0f;
-        
-        ctx->y = (float*)alloc_aligned(32, ctx->tau * sizeof(float));
-        ctx->u = (float*)alloc_aligned(32, ctx->tau * sizeof(float));
-        
-        if (ctx->y && ctx->u) {
-            memset(ctx->y, 0, ctx->tau * sizeof(float)); 
-            memset(ctx->u, 0, ctx->tau * sizeof(float)); 
 
-            float res[3] = {0};
-            compute_vrft_lsq(ctx->y, ctx->u, ctx->tau, ctx->high_limit, res);
-            
-            char resp[256];
-            snprintf(resp, sizeof(resp), 
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"Kp\": %.4f, \"Ki\": %.4f, \"Kd\": %.4f}", 
-                res[0], res[1], res[2]);
-            (void)send(ctx->client_fd, resp, strlen(resp), 0);
-        } else {
-            const char* err = "HTTP/1.1 500 Internal Server Error\r\n\r\n";
-            (void)send(ctx->client_fd, err, strlen(err), 0);
+    // 【修正一】加入 Socket Timeout，避免讀取被惡意或慢速請求掛死
+    struct timeval tv;
+    tv.tv_sec = 3;  // 3秒超時
+    tv.tv_usec = 0;
+    setsockopt(ctx->client_fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+
+    char buffer[8192] = {0};
+    int total_received = 0;
+    char* header_end = NULL;
+
+    // 【修正二】迴圈讀取，確切保證拿到完整的 HTTP Header（找到 \r\n\r\n 為止）
+    while (total_received < sizeof(buffer) - 1) {
+        int r = recv(ctx->client_fd, buffer + total_received, sizeof(buffer) - 1 - total_received, 0);
+        if (r <= 0) break;
+        total_received += r;
+        buffer[total_received] = '\0'; // 補上結尾以便字串搜尋
+
+        header_end = strstr(buffer, "\r\n\r\n");
+        if (header_end) {
+            break; 
         }
-        
-        free(ctx->y); // 利用 free(NULL) 合法特性，統一回收點
-        free(ctx->u);
     }
 
+    // 若成功拿到完整 Header 才開始處理
+    if (header_end) {
+        if (strncmp(buffer, "GET /health", 11) == 0) {
+            send_http_response(ctx->client_fd, "200 OK", "{\"status\": \"OK\", \"code\": 200}");
+        } 
+        else if (strncmp(buffer, "POST /vrft", 10) == 0) {
+            int content_length = 0;
+            // 找出 Content-Length (容錯大小寫)
+            char* cl_ptr = strstr(buffer, "Content-Length: ");
+            if (!cl_ptr) cl_ptr = strstr(buffer, "content-length: ");
+            
+            if (cl_ptr) {
+                content_length = atoi(cl_ptr + 16);
+            }
+
+            if (content_length > 0) {
+                header_end += 4; // 跳過 \r\n\r\n
+                int header_size = header_end - buffer;
+                int body_received = total_received - header_size;
+                
+                char* body_buffer = (char*)malloc(content_length + 1);
+                if (body_buffer) {
+                    memcpy(body_buffer, header_end, body_received);
+                    int body_read = body_received;
+                    
+                    // 迴圈把 Body(JSON) 剩下的資料徹底讀滿
+                    while (body_read < content_length) {
+                        int r = recv(ctx->client_fd, body_buffer + body_read, content_length - body_read, 0);
+                        if (r <= 0) break;
+                        body_read += r;
+                    }
+                    body_buffer[body_read] = '\0'; 
+
+                    // 使用 cJSON 解析
+                    cJSON *json = cJSON_Parse(body_buffer);
+                    if (json) {
+                        cJSON *j_tau = cJSON_GetObjectItem(json, "tau");
+                        cJSON *j_hl = cJSON_GetObjectItem(json, "high_limit");
+                        cJSON *j_y = cJSON_GetObjectItem(json, "y");
+                        cJSON *j_u = cJSON_GetObjectItem(json, "u");
+
+                        if (cJSON_IsNumber(j_tau) && cJSON_IsNumber(j_hl) && 
+                            cJSON_IsArray(j_y) && cJSON_IsArray(j_u)) {
+                            
+                            ctx->tau = j_tau->valueint;
+                            ctx->high_limit = (float)j_hl->valuedouble;
+                            
+                            int y_size = cJSON_GetArraySize(j_y);
+                            int u_size = cJSON_GetArraySize(j_u);
+
+                            if (ctx->tau > 0 && y_size >= ctx->tau && u_size >= ctx->tau) {
+                                ctx->y = (float*)alloc_aligned(32, ctx->tau * sizeof(float));
+                                ctx->u = (float*)alloc_aligned(32, ctx->tau * sizeof(float));
+                                
+                                if (ctx->y && ctx->u) {
+                                    cJSON *item_y = j_y->child;
+                                    cJSON *item_u = j_u->child;
+                                    for (int i = 0; i < ctx->tau; i++) {
+                                        ctx->y[i] = item_y ? (float)item_y->valuedouble : 0.0f;
+                                        ctx->u[i] = item_u ? (float)item_u->valuedouble : 0.0f;
+                                        if (item_y) item_y = item_y->next;
+                                        if (item_u) item_u = item_u->next;
+                                    }
+
+                                    // AVX 運算
+                                    float res[3] = {0};
+                                    compute_vrft_lsq(ctx->y, ctx->u, ctx->tau, ctx->high_limit, res);
+                                    
+                                    char resp_body[256];
+                                    snprintf(resp_body, sizeof(resp_body), 
+                                        "{\"Kp\": %.4f, \"Ki\": %.4f, \"Kd\": %.4f}", 
+                                        res[0], res[1], res[2]);
+                                    
+                                    send_http_response(ctx->client_fd, "200 OK", resp_body);
+
+                                } else {
+                                    send_http_response(ctx->client_fd, "500 Internal Server Error", "{\"error\": \"Alloc Failed\"}");
+                                }
+                            } else {
+                                send_http_response(ctx->client_fd, "400 Bad Request", "{\"error\": \"Array too small\"}");
+                            }
+                        } else {
+                            send_http_response(ctx->client_fd, "400 Bad Request", "{\"error\": \"Invalid JSON fields\"}");
+                        }
+                        cJSON_Delete(json);
+                    } else {
+                        send_http_response(ctx->client_fd, "400 Bad Request", "{\"error\": \"Invalid JSON format\"}");
+                    }
+                    free(body_buffer);
+                }
+            } else {
+                send_http_response(ctx->client_fd, "400 Bad Request", "{\"error\": \"Missing Content-Length\"}");
+            }
+        } else {
+            send_http_response(ctx->client_fd, "404 Not Found", "{\"error\": \"Endpoint not found\"}");
+        }
+    }
+
+    // 【修正三】TCP 優雅關閉 (Graceful Shutdown)，根絕 TCP RST (ConnectionResetError)
+    // 1. SHUT_WR 會告知 Python: "我資料送完了(送出 FIN)"
+    shutdown(ctx->client_fd, SHUT_WR);
+    
+    // 2. 把 Python 可能殘留還在送進來的封包吃乾淨 (排空緩衝區)
+    char discard[4096];
+    while (recv(ctx->client_fd, discard, sizeof(discard), 0) > 0) {
+        // do nothing
+    }
+
+    // 3. 完美且安全的釋放 Socket 與記憶體
     close(ctx->client_fd);
+    if (ctx->y) free(ctx->y);
+    if (ctx->u) free(ctx->u);
     free(ctx); 
     return NULL;
 }
@@ -165,6 +274,8 @@ int main(void) {
             continue;
         }
         ctx->client_fd = client_fd;
+        ctx->y = NULL;
+        ctx->u = NULL;
 
         pthread_t tid;
         if (pthread_create(&tid, NULL, api_router_worker, ctx) != 0) {
